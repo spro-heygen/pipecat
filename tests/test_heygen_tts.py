@@ -560,7 +560,7 @@ async def test_heygen_websocket_keepalive_never_names_a_closed_context():
     with patch("pipecat.services.heygen.tts._KEEPALIVE_INTERVAL_S", 0.05):
         async with serve(heygen, "127.0.0.1", 0) as server:
             await run_test(
-                _service(server),
+                _service(server, text_aggregation_mode=TextAggregationMode.TOKEN),
                 frames_to_send=[
                     SleepFrame(sleep=0.2),
                     LLMFullResponseStartFrame(),
