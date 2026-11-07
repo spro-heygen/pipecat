@@ -9,6 +9,7 @@
 import asyncio
 import base64
 import json
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -47,6 +48,18 @@ _ENVELOPE = (
 )
 
 
+@asynccontextmanager
+async def _http_tts(client, sample_rate: int = 24000, **kwargs):
+    async with aiohttp.ClientSession() as session:
+        yield HeyGenHttpTTSService(
+            api_key="test-key",
+            aiohttp_session=session,
+            base_url=str(client.make_url("/")),
+            sample_rate=sample_rate,
+            **kwargs,
+        )
+
+
 def _make_app(requests: list, audio: bytes = b"", status: int = 200, error: str = ""):
     async def handler(request):
         requests.append({"headers": dict(request.headers), "body": await request.json()})
@@ -79,13 +92,7 @@ async def test_heygen_tts_streams_pcm(aiohttp_client):
     pcm_audio = b"\x00\x01\x02\x03" * 1024
     client = await aiohttp_client(_make_app(requests, pcm_audio))
 
-    async with aiohttp.ClientSession() as session:
-        tts = HeyGenHttpTTSService(
-            api_key="test-key",
-            aiohttp_session=session,
-            base_url=str(client.make_url("/")),
-            sample_rate=24000,
-        )
+    async with _http_tts(client) as tts:
         down_frames, _ = await run_test(
             tts, frames_to_send=[TTSSpeakFrame(text="Hello from HeyGen.")]
         )
@@ -116,16 +123,13 @@ async def test_heygen_tts_settings_in_body(aiohttp_client):
     requests = []
     client = await aiohttp_client(_make_app(requests, b"\x00\x00" * 2048))
 
-    async with aiohttp.ClientSession() as session:
-        tts = HeyGenHttpTTSService(
-            api_key="test-key",
-            aiohttp_session=session,
-            base_url=str(client.make_url("/")),
-            sample_rate=16000,
-            settings=HeyGenHttpTTSService.Settings(
-                voice="my-voice", model="heygen-voice-1-turbo-free", language=Language.EN_US
-            ),
-        )
+    async with _http_tts(
+        client,
+        sample_rate=16000,
+        settings=HeyGenHttpTTSService.Settings(
+            voice="my-voice", model="heygen-voice-1-turbo-free", language=Language.EN_US
+        ),
+    ) as tts:
         await run_test(tts, frames_to_send=[TTSSpeakFrame(text="Hi.")])
 
     body = requests[0]["body"]
@@ -141,13 +145,7 @@ async def test_heygen_tts_unsupported_sample_rate_is_resampled(aiohttp_client):
     requests = []
     client = await aiohttp_client(_make_app(requests, b"\x00\x00" * 24000))
 
-    async with aiohttp.ClientSession() as session:
-        tts = HeyGenHttpTTSService(
-            api_key="test-key",
-            aiohttp_session=session,
-            base_url=str(client.make_url("/")),
-            sample_rate=32000,
-        )
+    async with _http_tts(client, sample_rate=32000) as tts:
         down_frames, _ = await run_test(tts, frames_to_send=[TTSSpeakFrame(text="Hi.")])
 
     assert requests[0]["body"]["output_format"]["sample_rate_hertz"] == 24000
@@ -162,13 +160,7 @@ async def test_heygen_tts_http_error(aiohttp_client):
     requests = []
     client = await aiohttp_client(_make_app(requests, status=429, error="Request limit reached."))
 
-    async with aiohttp.ClientSession() as session:
-        tts = HeyGenHttpTTSService(
-            api_key="test-key",
-            aiohttp_session=session,
-            base_url=str(client.make_url("/")),
-            sample_rate=24000,
-        )
+    async with _http_tts(client) as tts:
         _, up_frames = await run_test(tts, frames_to_send=[TTSSpeakFrame(text="Hi.")])
 
     errors = [f for f in up_frames if isinstance(f, ErrorFrame)]
@@ -228,13 +220,16 @@ class _FakeHeyGen:
         self.request = None
         self.sockets: list[list[dict]] = []
         self.peak_open = 0
+        self.stray: list[dict] = []
         self._open_contexts: set[str] = set()
+        self._accepting_contexts: set[str] = set()
 
     @property
     def messages(self) -> list[dict]:
         return [message for socket in self.sockets for message in socket]
 
     async def _final(self, ws, context_id: str):
+        self._accepting_contexts.discard(context_id)
         await asyncio.sleep(self.final_delay)
         self._open_contexts.discard(context_id)
         await ws.send(json.dumps({"isFinal": True, "contextId": context_id}))
@@ -265,7 +260,12 @@ class _FakeHeyGen:
                 text = message.get("text") or ""
                 if text == " ":
                     self._open_contexts.add(context_id)
+                    self._accepting_contexts.add(context_id)
                     self.peak_open = max(self.peak_open, len(self._open_contexts))
+                elif context_id not in self._accepting_contexts and not message.get(
+                    "close_context"
+                ):
+                    self.stray.append(message)
                 if text.strip() and refused:
                     await ws.send(
                         json.dumps(
@@ -301,6 +301,13 @@ def _service(server, **kwargs) -> HeyGenTTSService:
     host, port = next(iter(server.sockets)).getsockname()[:2]
     kwargs.setdefault("sample_rate", 24000)
     return HeyGenTTSService(api_key="test-key", url=f"ws://{host}:{port}", **kwargs)
+
+
+async def _connection_query(**kwargs) -> dict[str, list[str]]:
+    heygen = _FakeHeyGen()
+    async with serve(heygen, "127.0.0.1", 0) as server:
+        await run_test(_service(server, **kwargs), frames_to_send=[])
+    return parse_qs(urlparse(heygen.request.path).query)
 
 
 def _spoken_contexts(heygen: _FakeHeyGen) -> list[str]:
@@ -548,27 +555,26 @@ async def test_heygen_websocket_interruption_closes_context_and_keeps_socket():
 @pytest.mark.asyncio
 async def test_heygen_websocket_keepalive_never_names_a_closed_context():
     """Keepalives name only an open context; HeyGen opens a context for any other."""
-    tts = HeyGenTTSService(api_key="test-key", sample_rate=24000)
-    websocket = AsyncMock()
-    tts._websocket = websocket
+    heygen = _FakeHeyGen(final_delay=0.3)
 
-    def last_sent():
-        return json.loads(websocket.send.call_args_list[-1].args[0])
+    with patch("pipecat.services.heygen.tts._KEEPALIVE_INTERVAL_S", 0.05):
+        async with serve(heygen, "127.0.0.1", 0) as server:
+            await run_test(
+                _service(server),
+                frames_to_send=[
+                    SleepFrame(sleep=0.2),
+                    LLMFullResponseStartFrame(),
+                    LLMTextFrame("Hello there. "),
+                    SleepFrame(sleep=0.2),
+                    LLMFullResponseEndFrame(),
+                    SleepFrame(sleep=0.5),
+                ],
+            )
 
-    idle = {"context_id": "pipecat-keepalive", "close_context": True}
-
-    await tts._send_keepalive()
-    assert last_sent() == idle
-
-    tts._turn_context_id = "ctx-1"
-    tts._open_contexts.add("ctx-1")
-    await tts._send_keepalive()
-    assert last_sent() == {"text": "", "context_id": "ctx-1"}
-
-    # Closed but still the active context while its last audio arrives.
-    await tts._close_context("ctx-1")
-    await tts._send_keepalive()
-    assert last_sent() == idle
+    context_id = _spoken_contexts(heygen)[0]
+    assert {"text": "", "context_id": context_id} in heygen.messages
+    assert any(m.get("close_context") and m["context_id"] != context_id for m in heygen.messages)
+    assert heygen.stray == []
 
 
 @pytest.mark.asyncio
@@ -601,11 +607,15 @@ async def test_heygen_websocket_flush_names_only_an_open_context():
     websocket.send.assert_not_called()
 
 
-def test_heygen_websocket_token_mode_disables_auto_mode():
+@pytest.mark.parametrize(
+    "aggregation, auto_mode",
+    [(TextAggregationMode.TOKEN, "false"), (TextAggregationMode.SENTENCE, "true")],
+)
+@pytest.mark.asyncio
+async def test_heygen_websocket_auto_mode_follows_aggregation(aggregation, auto_mode):
     """Token streaming leaves generation to HeyGen's chunk schedule."""
-    tts = HeyGenTTSService(api_key="k", text_aggregation_mode=TextAggregationMode.TOKEN)
-    assert "auto_mode=false" in tts._build_websocket_url()
-    assert "auto_mode=true" in HeyGenTTSService(api_key="k")._build_websocket_url()
+    query = await _connection_query(text_aggregation_mode=aggregation)
+    assert query["auto_mode"] == [auto_mode]
 
 
 @pytest.mark.asyncio
@@ -627,9 +637,10 @@ async def test_heygen_websocket_unsupported_sample_rate_is_resampled():
     assert resampled < len(heygen.audio) * 0.6  # 24 kHz -> 11.025 kHz is about 0.46x the bytes
 
 
-def test_heygen_websocket_url_options():
+@pytest.mark.asyncio
+async def test_heygen_websocket_url_options():
     """Connection options and settings reach the URL only when given."""
-    plain = parse_qs(urlparse(HeyGenTTSService(api_key="k")._build_websocket_url()).query)
+    plain = await _connection_query()
     for name in (
         "enable_logging",
         "enable_ssml_parsing",
@@ -639,8 +650,7 @@ def test_heygen_websocket_url_options():
     ):
         assert name not in plain
 
-    tts = HeyGenTTSService(
-        api_key="k",
+    query = await _connection_query(
         enable_logging=False,
         enable_ssml_parsing=True,
         end_user_id="user-42",
@@ -648,7 +658,6 @@ def test_heygen_websocket_url_options():
             apply_text_normalization="off", expressiveness_boost=0.5
         ),
     )
-    query = parse_qs(urlparse(tts._build_websocket_url()).query)
     assert query["enable_logging"] == ["false"]
     assert query["enable_ssml_parsing"] == ["true"]
     assert query["end_user_id"] == ["user-42"]
@@ -661,21 +670,14 @@ async def test_heygen_unsupported_language_is_not_sent(aiohttp_client):
     """A language HeyGen doesn't speak is left out, so HeyGen detects the language."""
     requests = []
     client = await aiohttp_client(_make_app(requests, b"\x00\x00" * 2048))
-    async with aiohttp.ClientSession() as session:
-        http_tts = HeyGenHttpTTSService(
-            api_key="test-key",
-            aiohttp_session=session,
-            base_url=str(client.make_url("/")),
-            sample_rate=24000,
-            settings=HeyGenHttpTTSService.Settings(language=Language.NO),
-        )
+    async with _http_tts(
+        client, settings=HeyGenHttpTTSService.Settings(language=Language.NO)
+    ) as http_tts:
         await run_test(http_tts, frames_to_send=[TTSSpeakFrame(text="Hei.")])
     assert "language" not in requests[0]["body"]
 
-    ws_tts = HeyGenTTSService(
-        api_key="k", sample_rate=24000, settings=HeyGenTTSService.Settings(language=Language.NO)
-    )
-    assert "language=" not in ws_tts._build_websocket_url()
+    query = await _connection_query(settings=HeyGenTTSService.Settings(language=Language.NO))
+    assert "language" not in query
 
 
 @pytest.mark.asyncio

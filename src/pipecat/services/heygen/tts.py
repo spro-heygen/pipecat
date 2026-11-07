@@ -39,33 +39,31 @@ from pipecat.utils.network import exponential_backoff_time
 from pipecat.utils.tracing.service_decorators import traced_tts
 from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
-# Nadine, a HeyGen public voice. Works with every HeyGen Voice model, no clone needed.
+# Nadine, a HeyGen public voice. All HeyGen Voice models serve it.
 _DEFAULT_VOICE_ID = "83548de556df48ba8c09c42a57c51d85"
 
-# PCM sample rates HeyGen can synthesize over HTTP.
 _HTTP_SAMPLE_RATES = (8000, 16000, 22050, 24000, 44100, 48000)
 
-# PCM sample rates HeyGen can synthesize over the WebSocket.
 _WEBSOCKET_SAMPLE_RATES = (8000, 16000, 22050, 24000, 32000, 44100, 48000)
 
-# Rate requested when the pipeline runs at a rate HeyGen does not offer; the
-# audio is then resampled to the pipeline rate.
+# HeyGen synthesizes at this rate when it does not offer the pipeline rate. The
+# service then resamples the audio.
 _FALLBACK_SAMPLE_RATE = 24000
 
 _KEEPALIVE_INTERVAL_S = 10
 
-# A context ID the service never opens; idle keepalives close it.
+# The service never opens this context. Idle keepalives close it.
 _KEEPALIVE_CONTEXT_ID = "pipecat-keepalive"
 
-# HeyGen closes a socket with these while it cannot serve a context: 1012 for a
-# restart, 1013 when capacity is full. Both ask the client to try again.
+# HeyGen closes the socket with 1012 for a restart and 1013 for full capacity.
+# The client can try again after both.
 _RETRYABLE_CLOSE_CODES = (1012, 1013)
 
-# Sends of a refused context after the first, 1, 2 and 4 seconds apart.
+# The service sends a refused context again 3 times, after 1, 2 and 4 seconds.
 _MAX_CONTEXT_RETRIES = 3
 
-# A context that goes quiet this long is ended and its late audio dropped, so
-# this outlasts those retries and a slow first audio on Turbo Free.
+# The base class ends a context that is quiet for this time and drops its late
+# audio. This time must be longer than the retries.
 _AUDIO_CONTEXT_TIMEOUT_S = 12.0
 
 _ERROR_CATEGORIES: dict[str, ErrorCategory] = {
@@ -117,7 +115,6 @@ _LANGUAGE_MAP = {
     Language.ZH: "zh",
 }
 
-# Languages HeyGen Voice speaks, as the codes it accepts.
 _LANGUAGES = frozenset(_LANGUAGE_MAP.values())
 
 
@@ -133,21 +130,12 @@ def language_to_heygen_language(language: Language) -> str:
     Returns:
         The corresponding HeyGen language code.
     """
-    code = resolve_language(language, _LANGUAGE_MAP, use_base_code=True)
-    if code not in _LANGUAGES:
-        logger.warning(f"HeyGen Voice does not speak {language}; HeyGen will detect the language.")
-    return code
+    return resolve_language(language, _LANGUAGE_MAP, use_base_code=True)
 
 
-def _request_language(language: Any) -> str | None:
-    """The language to send to HeyGen, or None to let HeyGen detect it.
-
-    HeyGen refuses a language it does not speak, so those are left out.
-    """
-    if not language:
-        return None
-    code = str(language)
-    return code if code in _LANGUAGES else None
+def _synthesis_rate(sample_rate: int, supported: tuple[int, ...]) -> int:
+    """Return the PCM rate to request from HeyGen for the pipeline's rate."""
+    return sample_rate if sample_rate in supported else _FALLBACK_SAMPLE_RATE
 
 
 def _error_detail(body: str | bytes) -> str:
@@ -256,36 +244,6 @@ class HeyGenHttpTTSService(TTSService):
         """
         return language_to_heygen_language(language)
 
-    def _synthesis_sample_rate(self) -> int:
-        """Return the PCM rate to request from HeyGen for the pipeline's rate."""
-        if self.sample_rate in _HTTP_SAMPLE_RATES:
-            return self.sample_rate
-        return _FALLBACK_SAMPLE_RATE
-
-    def _build_payload(self, text: str, synthesis_sample_rate: int) -> dict[str, Any]:
-        """Build the request body for one piece of text.
-
-        Args:
-            text: Text to synthesize.
-            synthesis_sample_rate: PCM sample rate to request.
-
-        Returns:
-            The JSON request body.
-        """
-        payload: dict[str, Any] = {
-            "text": text,
-            "voice_id": assert_given(self._settings.voice),
-            "model": assert_given(self._settings.model),
-            "output_format": {
-                "encoding": "pcm",
-                "sample_rate_hertz": synthesis_sample_rate,
-            },
-        }
-        language = _request_language(assert_given(self._settings.language))
-        if language:
-            payload["language"] = language
-        return payload
-
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
         """Generate speech from text using HeyGen's streaming speech endpoint.
@@ -297,26 +255,33 @@ class HeyGenHttpTTSService(TTSService):
         Yields:
             Frame: Audio frames containing the synthesized speech.
         """
-        synthesis_sample_rate = self._synthesis_sample_rate()
+        synthesis_sample_rate = _synthesis_rate(self.sample_rate, _HTTP_SAMPLE_RATES)
         headers = {"x-api-key": self._api_key, "Content-Type": "application/json"}
+        payload: dict[str, Any] = {
+            "text": text,
+            "voice_id": assert_given(self._settings.voice),
+            "model": assert_given(self._settings.model),
+            "output_format": {
+                "encoding": "pcm",
+                "sample_rate_hertz": synthesis_sample_rate,
+            },
+        }
+        # HeyGen refuses a language it does not speak, and detects one left out.
+        language = assert_given(self._settings.language)
+        if language in _LANGUAGES:
+            payload["language"] = language
 
         try:
-            async with self._session.post(
-                self._url,
-                json=self._build_payload(text, synthesis_sample_rate),
-                headers=headers,
-            ) as response:
-                request_id = response.headers.get("X-Request-Id")
+            async with self._session.post(self._url, json=payload, headers=headers) as response:
                 if response.status != 200:
                     error = _error_detail(await response.text(errors="ignore"))
                     yield ErrorFrame(error=f"HeyGen TTS error (status: {response.status}): {error}")
                     return
 
-                logger.debug(f"{self}: HeyGen request {request_id}")
                 await self.start_tts_usage_metrics(text)
 
-                # Raw PCM16 arrives at arbitrary byte boundaries; the helper keeps
-                # frames sample-aligned and resamples when the rates differ.
+                # A chunk can split a sample. The helper keeps frames sample-aligned
+                # and resamples them.
                 async for frame in self._stream_audio_frames_from_iterator(
                     response.content.iter_chunked(self.chunk_size),
                     in_sample_rate=synthesis_sample_rate,
@@ -460,10 +425,10 @@ class HeyGenTTSService(WebsocketTTSService):
             push_text_frames=False,
             push_start_frame=True,
             stop_frame_timeout_s=_AUDIO_CONTEXT_TIMEOUT_S,
-            # HeyGen closes the socket past 5 running contexts, so a turn's audio
-            # plays out before the next turn opens one.
+            # HeyGen closes the socket at more than 5 running contexts. So a turn
+            # plays its audio before the next turn opens a context.
             pause_frame_processing=True,
-            # HeyGen joins text messages as sent, so sentences need a separating space.
+            # HeyGen joins text messages without a separator.
             append_trailing_space=True,
             sample_rate=sample_rate,
             settings=default_settings,
@@ -480,17 +445,16 @@ class HeyGenTTSService(WebsocketTTSService):
         self._auto_mode = auto_mode
 
         self._receive_task = None
-        # The rate HeyGen synthesizes at; set when the URL is built.
+        # HeyGen's synthesis rate. The URL builder sets it.
         self._synthesis_sample_rate = _FALLBACK_SAMPLE_RATE
-        # How long the last refused handshake asked to wait.
+        # The wait, in seconds, that the last refused handshake asked for.
         self._reconnect_delay = 0.0
-        # Contexts opened and not yet closed. HeyGen opens a context for a message
-        # naming any other, so only these may be named.
+        # Open contexts. A message that names any other context opens it at HeyGen.
         self._open_contexts: set[str] = set()
-        # Every message sent to a context that has no audio yet, to send again
-        # if HeyGen refuses it. No audio means nothing would be spoken twice.
+        # Messages sent to contexts with no audio yet. The service sends them again
+        # if HeyGen refuses the context. With no audio, nothing is spoken twice.
         self._unanswered: dict[str, list[str]] = {}
-        # While True the socket is being replaced; messages wait in _unanswered.
+        # True while the socket is replaced. Messages then wait in _unanswered.
         self._retrying = False
         self._word_clocks: dict[str, _WordClock] = {}
 
@@ -555,20 +519,15 @@ class HeyGenTTSService(WebsocketTTSService):
         return changed
 
     def _build_websocket_url(self) -> str:
-        # At a rate HeyGen does not offer, synthesize at the fallback rate and
-        # resample each audio message to the pipeline rate.
-        if self.sample_rate in _WEBSOCKET_SAMPLE_RATES:
-            self._synthesis_sample_rate = self.sample_rate
-        else:
-            self._synthesis_sample_rate = _FALLBACK_SAMPLE_RATE
+        self._synthesis_sample_rate = _synthesis_rate(self.sample_rate, _WEBSOCKET_SAMPLE_RATES)
         params = {
             "voice_id": assert_given(self._settings.voice),
             "model": assert_given(self._settings.model),
             "output_format": f"pcm_{self._synthesis_sample_rate}",
             "auto_mode": str(self._auto_mode).lower(),
         }
-        language = _request_language(assert_given(self._settings.language))
-        if language:
+        language = assert_given(self._settings.language)
+        if language in _LANGUAGES:
             params["language"] = language
         if self._settings.apply_text_normalization is not None:
             params["apply_text_normalization"] = self._settings.apply_text_normalization
@@ -601,7 +560,7 @@ class HeyGenTTSService(WebsocketTTSService):
             self._websocket = None
             error = f"{e}"
             if isinstance(e, InvalidStatus):
-                # The refusal's reason is in the response, not the exception message.
+                # The response holds the reason for the refusal.
                 if e.response.body:
                     error += f": {_error_detail(e.response.body.decode(errors='replace'))}"
                 retry_after = e.response.headers.get("Retry-After", "")
@@ -655,7 +614,7 @@ class HeyGenTTSService(WebsocketTTSService):
         try:
             await self._websocket.send(raw)
         except ConnectionClosed as e:
-            # The receive loop owns a lost connection and what happens to its contexts.
+            # The receive loop handles a lost connection and its contexts.
             logger.debug(f"{self}: message to context {context_id} not sent: {e}")
 
     async def _close_context(self, context_id: str | None):
@@ -681,7 +640,7 @@ class HeyGenTTSService(WebsocketTTSService):
     async def on_turn_context_completed(self):
         """Close the turn's context so its final message arrives."""
         context_id = self._turn_context_id
-        # The parent flushes first; a close without a flush discards unspoken text.
+        # The parent flushes first. A close without a flush discards unspoken text.
         await super().on_turn_context_completed()
         await self._close_context(context_id)
 
@@ -698,9 +657,9 @@ class HeyGenTTSService(WebsocketTTSService):
         await super().on_audio_context_completed(context_id)
 
     async def _send_keepalive(self):
-        # HeyGen opens a context for a keepalive naming one that is not open
-        # (with no context_id, one named "default"), so a keepalive names only an
-        # open context. Without one, closing a context that does not exist resets
+        # A keepalive that names a closed context opens it at HeyGen. With no
+        # context_id, it opens "default". So a keepalive names only an open context.
+        # With no open context, the service closes an unknown context. This resets
         # HeyGen's inactivity timer and changes nothing else.
         context_id = self.get_active_audio_context_id()
         if context_id in self._open_contexts:
@@ -787,7 +746,7 @@ class HeyGenTTSService(WebsocketTTSService):
             await self.append_to_audio_context(context_id, TTSStoppedFrame(context_id=context_id))
             await self.remove_audio_context(context_id)
         self._forget_context(context_id)
-        # A final context takes no more text, so the turn's next sentence needs a new one.
+        # A final context takes no more text. The next sentence needs a new context.
         if context_id and context_id == self._turn_context_id:
             self._turn_context_id = None
             self._turn_context_id = self.create_context_id()
@@ -798,7 +757,7 @@ class HeyGenTTSService(WebsocketTTSService):
         await self.add_word_timestamps(
             words,
             context_id,
-            includes_inter_frame_spaces=True if language in ("ja", "zh") else None,
+            includes_inter_frame_spaces=language in ("ja", "zh"),
         )
 
     @traced_tts
@@ -814,8 +773,8 @@ class HeyGenTTSService(WebsocketTTSService):
         """
         try:
             if not self._retrying:
-                # A reconnect in progress owns the connection, and a handshake
-                # made alongside it spends the rate limit it may be waiting out.
+                # Do not connect during a reconnect. A second handshake spends the
+                # rate limit that the reconnect waits for.
                 if not self._is_connected and not self._reconnect_in_progress:
                     await self._connect()
                 if not self._is_connected:
@@ -830,7 +789,6 @@ class HeyGenTTSService(WebsocketTTSService):
             await self._send(context_id, text=text)
             await self.start_tts_usage_metrics(text)
 
-            # The audio frames will be handled in _receive_messages
             yield None
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
