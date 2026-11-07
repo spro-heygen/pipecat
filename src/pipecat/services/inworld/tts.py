@@ -112,6 +112,11 @@ def format_inworld_pronunciation(word: str, ipa: str) -> str | None:
     return f"/{ipa}/" if ipa and " " not in ipa else None
 
 
+def _supports_sentence_boundary(model: str | NotGiven | None) -> bool:
+    # The SENTENCE_BOUNDARY auto-mode strategy is only served by inworld-tts-2 models.
+    return isinstance(model, str) and model.startswith("inworld-tts-2")
+
+
 def _tts_2_expression_adapter(
     model: Any,
     tts_2: InworldExpressionAdapter,
@@ -726,7 +731,10 @@ class InworldTTSService(WebsocketTTSService):
                     Use ``text_aggregation_mode`` instead.
                     Will be removed in 2.0.0.
 
-            text_aggregation_mode: How to aggregate text before synthesis.
+            text_aggregation_mode: How to aggregate text before synthesis. With
+                ``TextAggregationMode.TOKEN``, auto mode and an ``inworld-tts-2``
+                model, tokens are streamed as they arrive and the server splits
+                them at sentence boundaries.
             append_trailing_space: Whether to append a trailing space to text before sending to TTS.
             **kwargs: Additional arguments passed to the parent class.
         """
@@ -805,11 +813,6 @@ class InworldTTSService(WebsocketTTSService):
         self._cumulative_time = 0.0
         # Track the end time of the last word in the current generation
         self._generation_end_time = 0.0
-
-        # Context IDs already sent to the server via _send_context, used to
-        # make _send_context idempotent so on_turn_context_created can eagerly
-        # open contexts without causing duplicate creates in run_tts.
-        self._sent_context_ids: set[str] = set()
 
         # Fallback tracking for when timestamps are not received. Without
         # timestamps, interruptions commit the full text rather than only the
@@ -904,17 +907,6 @@ class InworldTTSService(WebsocketTTSService):
         self._cumulative_time = 0.0
         self._generation_end_time = 0.0
 
-    async def on_turn_context_created(self, context_id: str):
-        """Eagerly open the context on the server when a new turn starts.
-
-        This overlaps server-side context creation with sentence aggregation
-        time, so the context is ready by the time text arrives in run_tts.
-        """
-        try:
-            await self._send_context(context_id)
-        except Exception as e:
-            logger.warning(f"{self}: Failed to pre-open context: {e}")
-
     def _calculate_word_times(self, timestamp_info: dict[str, Any]) -> list[tuple[str, float]]:
         """Calculate word timestamps from Inworld WebSocket API response.
 
@@ -953,16 +945,18 @@ class InworldTTSService(WebsocketTTSService):
 
         return word_times
 
-    async def _close_context(self, context_id: str | None):
+    async def _close_context(self, context_id: str | None, *, cancel: bool = False):
         if not context_id:
             return
         if self._websocket:
-            logger.info(f"{self}: Closing context {context_id} due to interruption or completion")
+            logger.info(f"{self}: {'Cancelling' if cancel else 'Closing'} context {context_id}")
             try:
-                await self._send_close_context(context_id)
+                if cancel:
+                    await self._send_cancel_context(context_id)
+                else:
+                    await self._send_close_context(context_id)
             except Exception as e:
                 await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
-        self._sent_context_ids.discard(context_id)
 
     async def on_turn_context_completed(self):
         """Close the server-side context at end of turn.
@@ -971,13 +965,15 @@ class InworldTTSService(WebsocketTTSService):
         last audio byte.
         """
         ctx_id = self._turn_context_id
+        opened = ctx_id is not None and self.audio_context_available(ctx_id)
         await super().on_turn_context_completed()
-        await self._close_context(ctx_id)
+        if opened:
+            await self._close_context(ctx_id)
 
     async def on_audio_context_interrupted(self, context_id: str):
         """Callback invoked when an audio context has been interrupted."""
         await self._maybe_push_fallback_text(context_id)
-        await self._close_context(context_id)
+        await self._close_context(context_id, cancel=True)
         await super().on_audio_context_interrupted(context_id)
 
     async def _maybe_push_fallback_text(self, context_id: str):
@@ -1085,7 +1081,7 @@ class InworldTTSService(WebsocketTTSService):
                 logger.debug("Disconnecting from Inworld WebSocket TTS")
                 try:
                     for ctx_id in self.get_audio_contexts():
-                        await self._send_close_context(ctx_id)
+                        await self._send_cancel_context(ctx_id)
                 except Exception as e:
                     # The connection is already gone; it still needs closing.
                     logger.debug(f"{self}: unable to close contexts before disconnecting: {e}")
@@ -1095,7 +1091,6 @@ class InworldTTSService(WebsocketTTSService):
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:
             self._websocket = None
-            self._sent_context_ids.clear()
             self._reset_generation_timing()
             self._context_texts.clear()
             self._contexts_with_timestamps.clear()
@@ -1210,15 +1205,9 @@ class InworldTTSService(WebsocketTTSService):
     async def _send_context(self, context_id: str):
         """Send a context to the Inworld WebSocket TTS service.
 
-        Idempotent: skips the send if this context was already opened on the
-        server (e.g., eagerly via on_turn_context_created).
-
         Args:
             context_id: The context ID.
         """
-        if context_id in self._sent_context_ids:
-            return
-
         audio_config = {
             "audioEncoding": self._audio_encoding,
             "sampleRateHertz": self._audio_sample_rate,
@@ -1242,20 +1231,31 @@ class InworldTTSService(WebsocketTTSService):
             create_config["applyTextNormalization"] = self._apply_text_normalization
         if self._auto_mode is not None:
             create_config["autoMode"] = self._auto_mode
+        sentence_boundary = bool(
+            self._auto_mode
+            and self._is_streaming_tokens
+            and _supports_sentence_boundary(self._settings.model)
+        )
+        if sentence_boundary:
+            # Let the server find sentence boundaries in the raw token stream.
+            create_config["autoModeStrategy"] = "SENTENCE_BOUNDARY"
         if self._timestamp_transport_strategy is not None:
             create_config["timestampTransportStrategy"] = self._timestamp_transport_strategy
 
         # Set buffer settings for timely audio generation.
         # Use provided values or defaults that work well for streaming LLM output.
         create_config["maxBufferDelayMs"] = self._buffer_settings["maxBufferDelayMs"] or 3000
-        create_config["bufferCharThreshold"] = self._buffer_settings["bufferCharThreshold"] or 250
+        buffer_char_threshold = self._buffer_settings["bufferCharThreshold"]
+        # With SENTENCE_BOUNDARY the threshold also cuts long sentences, so only a set
+        # value is sent and the server default applies otherwise.
+        if buffer_char_threshold or not sentence_boundary:
+            create_config["bufferCharThreshold"] = buffer_char_threshold or 250
 
         create_config["timestampType"] = self._timestamp_type
 
         msg = {"create": create_config, "contextId": context_id}
         logger.trace(f"{self}: Sending context create: {create_config}")
         await self._get_websocket().send(json.dumps(msg))
-        self._sent_context_ids.add(context_id)
 
     async def _send_text(self, context_id: str, text: str):
         """Send text to the Inworld WebSocket TTS service.
@@ -1283,6 +1283,15 @@ class InworldTTSService(WebsocketTTSService):
             context_id: The context ID.
         """
         msg = {"close_context": {}, "contextId": context_id}
+        await self._get_websocket().send(json.dumps(msg))
+
+    async def _send_cancel_context(self, context_id: str):
+        """Stop a context, discarding text the server has not synthesized yet.
+
+        Args:
+            context_id: The context ID.
+        """
+        msg = {"cancel_context": {}, "contextId": context_id}
         await self._get_websocket().send(json.dumps(msg))
 
     @traced_tts
