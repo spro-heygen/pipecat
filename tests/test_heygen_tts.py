@@ -439,7 +439,7 @@ async def test_heygen_websocket_gives_up_on_a_turn_but_not_the_service(no_backof
         )
 
     assert tts.is_usable
-    assert len(heygen.sockets) == 6  # the first send, three retries, the reconnect, the next turn
+    assert len(heygen.sockets) == 5  # the first send, three retries, the next turn
     assert [m["text"] for m in heygen.sockets[3] if (m.get("text") or "").strip()] == ["Lost. "]
     assert [f.text for f in down_frames if isinstance(f, TTSTextFrame)] == ["Spoken."]
 

@@ -716,7 +716,6 @@ class HeyGenTTSService(WebsocketTTSService):
             delay = exponential_backoff_time(attempt, min_wait=1, max_wait=4)
             logger.warning(f"{self}: HeyGen cannot serve the turn yet, retrying in {delay} s")
             await asyncio.sleep(delay)
-            self._websocket = None
             await self._connect_websocket()
             messages = [raw for sent in self._unanswered.values() for raw in sent]
         finally:
