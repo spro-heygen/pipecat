@@ -21,7 +21,6 @@ from typing import Any, ClassVar
 
 import websockets
 from loguru import logger
-from websockets.exceptions import InvalidStatus
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
@@ -639,10 +638,6 @@ class ElevenLabsTTSBase(WebsocketTTSService):
     async def _close_context(self, context_id: str):
         """Close a server-side context to free its slot."""
 
-    def _websocket_headers(self) -> dict[str, str]:
-        """Build the headers that authenticate a new connection."""
-        return {"xi-api-key": self._api_key}
-
     async def _on_websocket_connected(self):
         """Run any protocol-specific setup once the connection is open."""
 
@@ -740,7 +735,7 @@ class ElevenLabsTTSBase(WebsocketTTSService):
             self._websocket = await self._websocket_connect(
                 self._build_websocket_url(),
                 max_size=16 * 1024 * 1024,
-                additional_headers=self._websocket_headers(),
+                additional_headers={"xi-api-key": self._api_key},
             )
 
             await self._on_websocket_connected()
@@ -748,12 +743,8 @@ class ElevenLabsTTSBase(WebsocketTTSService):
             await self._call_event_handler("on_connected")
         except Exception as e:
             self._websocket = None
-            error = f"{e}"
-            if isinstance(e, InvalidStatus) and e.response.body:
-                # The refusal's reason is in the response body, not the exception message.
-                error += f": {e.response.body.decode(errors='replace')[:500]}"
-            await self.push_error(error_msg=f"Unknown error occurred: {error}", exception=e)
-            await self._call_event_handler("on_connection_error", error)
+            await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
+            await self._call_event_handler("on_connection_error", f"{e}")
 
     async def _disconnect_websocket(self):
         try:
@@ -772,8 +763,7 @@ class ElevenLabsTTSBase(WebsocketTTSService):
                     await asyncio.wait_for(websocket.wait_closed(), timeout=2.0)
                 except TimeoutError:
                     logger.debug(
-                        f"{self.CONNECTION_NAME} did not close the WebSocket within 2.0s; "
-                        "closing from our side"
+                        "ElevenLabs did not close the WebSocket within 2.0s; closing from our side"
                     )
                 await websocket.close()
                 logger.debug(f"Disconnected from {self.CONNECTION_NAME}")

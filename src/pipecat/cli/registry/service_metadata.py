@@ -948,6 +948,7 @@ class ServiceRegistry:
             env_prefix="HEYGEN",
             include_params=["api_key"],
             settings_params=["voice"],
+            param_defaults={"voice": "83548de556df48ba8c09c42a57c51d85"},
         ),
         ServiceDefinition(
             value="inworld_tts",

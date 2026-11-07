@@ -33,6 +33,9 @@ from pipecat.workers.runner import WorkerRunner
 
 load_dotenv(override=True)
 
+
+# We use lambdas to defer transport parameter creation until the transport
+# type is selected at runtime.
 transport_params = {
     "eval": lambda: EvalTransportParams(
         audio_in_enabled=True,
@@ -75,7 +78,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         llm = OpenAILLMService(
             api_key=os.environ["OPENAI_API_KEY"],
             settings=OpenAILLMService.Settings(
-                system_instruction="You are a helpful AI demonstrating HeyGen Voice. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a friendly and helpful way.",
+                system_instruction="You are a helpful assistant in a voice conversation. Your responses will be spoken aloud, so avoid emojis, bullet points, or other formatting that can't be spoken. Respond to what the user said in a creative, helpful, and brief way.",
             ),
         )
 
@@ -87,13 +90,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
         pipeline = Pipeline(
             [
-                transport.input(),
+                transport.input(),  # Transport user input
                 stt,
-                user_aggregator,
-                llm,
-                tts,
-                transport.output(),
-                assistant_aggregator,
+                user_aggregator,  # User responses
+                llm,  # LLM
+                tts,  # TTS
+                transport.output(),  # Transport bot output
+                assistant_aggregator,  # Assistant spoken responses
             ]
         )
 
